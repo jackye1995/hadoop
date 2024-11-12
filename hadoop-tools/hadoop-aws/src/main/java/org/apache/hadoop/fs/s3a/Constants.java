@@ -1717,4 +1717,11 @@ public final class Constants {
    * Value: {@value}.
    */
   public static final String S3A_IO_RATE_LIMIT = "fs.s3a.io.rate.limit";
+
+  /**
+   * Credentials Resolver
+   */
+  public static final String FS_S3A_CREDENTIALS_RESOLVER = "fs.s3a.credentials.resolver";
+
+  public static final String FS_S3A_CREDENTIALS_RESOLVER_DEFAULT = "None";
 }

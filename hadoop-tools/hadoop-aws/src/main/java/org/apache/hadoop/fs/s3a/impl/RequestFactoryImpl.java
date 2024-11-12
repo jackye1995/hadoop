@@ -20,11 +20,21 @@ package org.apache.hadoop.fs.s3a.impl;
 
 import java.time.Duration;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.s3a.resolver.S3RequestCall;
+import org.apache.hadoop.fs.s3a.resolver.S3CredentialsResolver;
+import org.apache.hadoop.fs.s3a.resolver.S3Resource;
+import org.apache.hadoop.security.UserGroupInformation;
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.awscore.AwsRequest;
+import software.amazon.awssdk.awscore.AwsRequestOverrideConfiguration;
 import software.amazon.awssdk.core.SdkRequest;
 import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
@@ -64,6 +74,9 @@ import static org.apache.hadoop.fs.s3a.Constants.DEFAULT_PART_UPLOAD_TIMEOUT;
 import static org.apache.hadoop.fs.s3a.S3AEncryptionMethods.UNKNOWN_ALGORITHM;
 import static org.apache.hadoop.fs.s3a.impl.AWSClientConfig.setRequestTimeout;
 import static org.apache.hadoop.fs.s3a.impl.InternalConstants.DEFAULT_UPLOAD_PART_COUNT_LIMIT;
+import static org.apache.hadoop.fs.s3a.util.S3CredentialsProviderUtils.getS3Request;
+import static org.apache.hadoop.fs.s3a.util.S3CredentialsProviderUtils.getS3CredentialsResolver;
+import static org.apache.hadoop.fs.s3a.util.S3CredentialsProviderUtils.getS3Resources;
 import static org.apache.hadoop.util.Preconditions.checkArgument;
 import static org.apache.hadoop.util.Preconditions.checkNotNull;
 import static software.amazon.awssdk.services.s3.model.StorageClass.UNKNOWN_TO_SDK_VERSION;
@@ -137,6 +150,12 @@ public class RequestFactoryImpl implements RequestFactory {
    */
   private final Duration partUploadTimeout;
 
+  private final Configuration hadoopConfiguration;
+
+  private final UserGroupInformation userGroupInformation;
+
+  private final S3RequestCall S3RequestCall;
+
   /**
    * Constructor.
    * @param builder builder with all the configuration.
@@ -152,6 +171,9 @@ public class RequestFactoryImpl implements RequestFactory {
     this.storageClass = builder.storageClass;
     this.isMultipartUploadEnabled = builder.isMultipartUploadEnabled;
     this.partUploadTimeout = builder.partUploadTimeout;
+    this.hadoopConfiguration = builder.hadoopConfiguration;
+    this.userGroupInformation = builder.userGroupInformation;
+    this.S3RequestCall = builder.S3RequestCall;
   }
 
   /**
@@ -164,7 +186,38 @@ public class RequestFactoryImpl implements RequestFactory {
     if (requestPreparer != null) {
       requestPreparer.prepareRequest(t);
     }
+
+    if (t instanceof AwsRequest.Builder) {
+      addRequestCredentialsProvider((AwsRequest.Builder) t);
+    } else {
+      LOG.debug(
+          "Request credentials provider not added for request: {} as the request was not an instance of AwsRequest.Builder",
+          t.build());
+    }
     return t;
+  }
+
+  private <T extends AwsRequest.Builder> void addRequestCredentialsProvider(T t) {
+    AwsRequestOverrideConfiguration.Builder beforeConfig =
+        t.overrideConfiguration() != null ?
+            t.overrideConfiguration().toBuilder() :
+            AwsRequestOverrideConfiguration.builder();
+
+    LOG.info("Loading S3 credentials resolver");
+    S3CredentialsResolver s3CredentialsResolver = getS3CredentialsResolver(hadoopConfiguration, userGroupInformation);
+    S3RequestCall.setBucket(bucket);
+    S3RequestCall.setS3Requests(Collections.singletonList(getS3Request(t)));
+    LOG.debug("S3Call: {}", S3RequestCall);
+
+    if (s3CredentialsResolver != null) {
+      AwsCredentialsProvider provider = s3CredentialsResolver.resolve(S3RequestCall);
+      if (provider != null) {
+        t.overrideConfiguration(beforeConfig.credentialsProvider(provider).build());
+        LOG.debug("Credentials provider is set at request: {}", t.build());
+      } else {
+        LOG.error("Credentials provider is not set at request: {}", t.build());
+      }
+    }
   }
 
   /**
@@ -260,6 +313,7 @@ public class RequestFactoryImpl implements RequestFactory {
     copyObjectRequestBuilder.destinationBucket(getBucket())
         .destinationKey(dstKey).sourceBucket(getBucket()).sourceKey(srcKey);
 
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.OBJECT, getBucket(), srcKey));
     return prepareRequest(copyObjectRequestBuilder);
   }
 
@@ -359,6 +413,7 @@ public class RequestFactoryImpl implements RequestFactory {
       setRequestTimeout(putObjectRequestBuilder, partUploadTimeout);
     }
 
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.OBJECT, getBucket(), key));
     return prepareRequest(putObjectRequestBuilder);
   }
 
@@ -433,6 +488,7 @@ public class RequestFactoryImpl implements RequestFactory {
 
     putEncryptionParameters(putObjectRequestBuilder);
 
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.OBJECT, getBucket(), key));
     return prepareRequest(putObjectRequestBuilder);
   }
 
@@ -446,6 +502,8 @@ public class RequestFactoryImpl implements RequestFactory {
     if (prefix != null) {
       requestBuilder.prefix(prefix);
     }
+
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.PREFIX, getBucket(), prefix));
     return prepareRequest(requestBuilder);
   }
 
@@ -456,6 +514,7 @@ public class RequestFactoryImpl implements RequestFactory {
     AbortMultipartUploadRequest.Builder requestBuilder =
         AbortMultipartUploadRequest.builder().bucket(getBucket()).key(destKey).uploadId(uploadId);
 
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.OBJECT, getBucket(), destKey));
     return prepareRequest(requestBuilder);
   }
 
@@ -525,6 +584,7 @@ public class RequestFactoryImpl implements RequestFactory {
       requestBuilder.storageClass(storageClass);
     }
 
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.OBJECT, getBucket(), destKey));
     return prepareRequest(requestBuilder);
   }
 
@@ -539,6 +599,7 @@ public class RequestFactoryImpl implements RequestFactory {
         CompleteMultipartUploadRequest.builder().bucket(bucket).key(destKey).uploadId(uploadId)
             .multipartUpload(CompletedMultipartUpload.builder().parts(partETags).build());
 
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.OBJECT, getBucket(), destKey));
     return prepareRequest(requestBuilder);
   }
 
@@ -555,6 +616,7 @@ public class RequestFactoryImpl implements RequestFactory {
           .sseCustomerKeyMD5(Md5Utils.md5AsBase64(Base64.getDecoder().decode(base64customerKey)));
     });
 
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.OBJECT, getBucket(), key));
     return prepareRequest(headObjectRequestBuilder);
   }
 
@@ -564,6 +626,7 @@ public class RequestFactoryImpl implements RequestFactory {
     HeadBucketRequest.Builder headBucketRequestBuilder =
         HeadBucketRequest.builder().bucket(bucketName);
 
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.BUCKET, getBucket()));
     return prepareRequest(headBucketRequestBuilder);
   }
 
@@ -580,6 +643,7 @@ public class RequestFactoryImpl implements RequestFactory {
           .sseCustomerKeyMD5(Md5Utils.md5AsBase64(Base64.getDecoder().decode(base64customerKey)));
     });
 
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.OBJECT, getBucket(), key));
     return prepareRequest(builder);
   }
 
@@ -613,6 +677,8 @@ public class RequestFactoryImpl implements RequestFactory {
 
     // Set the request timeout for the part upload
     setRequestTimeout(builder, partUploadTimeout);
+
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.OBJECT, getBucket(), destKey));
     return prepareRequest(builder);
   }
 
@@ -629,6 +695,7 @@ public class RequestFactoryImpl implements RequestFactory {
       requestBuilder.delimiter(delimiter);
     }
 
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.PREFIX, getBucket(), key));
     return prepareRequest(requestBuilder);
   }
 
@@ -647,17 +714,24 @@ public class RequestFactoryImpl implements RequestFactory {
       requestBuilder.delimiter(delimiter);
     }
 
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.PREFIX, getBucket(), key));
     return prepareRequest(requestBuilder);
   }
 
   @Override
   public DeleteObjectRequest.Builder newDeleteObjectRequestBuilder(String key) {
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.OBJECT, getBucket(), key));
     return prepareRequest(DeleteObjectRequest.builder().bucket(bucket).key(key));
   }
 
   @Override
   public DeleteObjectsRequest.Builder newBulkDeleteRequestBuilder(
           List<ObjectIdentifier> keysToDelete) {
+    List<String> keys = keysToDelete
+        .stream()
+        .map(ObjectIdentifier::key)
+        .collect(Collectors.toList());
+    S3RequestCall.setS3Resources(getS3Resources(S3Resource.Type.OBJECT, getBucket(), keys));
     return prepareRequest(DeleteObjectsRequest
         .builder()
         .bucket(bucket)
@@ -726,6 +800,15 @@ public class RequestFactoryImpl implements RequestFactory {
      * A zero value means "no custom timeout"
      */
     private Duration partUploadTimeout = DEFAULT_PART_UPLOAD_TIMEOUT;
+
+    /**
+     * Hadoop Configuration
+     */
+    private Configuration hadoopConfiguration;
+
+    private UserGroupInformation userGroupInformation;
+
+    private S3RequestCall S3RequestCall;
 
     private RequestFactoryBuilder() {
     }
@@ -834,6 +917,36 @@ public class RequestFactoryImpl implements RequestFactory {
      */
     public RequestFactoryBuilder withPartUploadTimeout(final Duration value) {
       partUploadTimeout = value;
+      return this;
+    }
+
+    /**
+     * Hadoop Configuration.
+     * @param value new value
+     * @return the builder
+     */
+    public RequestFactoryBuilder withHadoopConf(final Configuration value) {
+      this.hadoopConfiguration = value;
+      return this;
+    }
+
+    /**
+     * Hadoop Configuration.
+     * @param value new value
+     * @return the builder
+     */
+    public RequestFactoryBuilder withUserGroupInformation(final UserGroupInformation value) {
+      this.userGroupInformation = value;
+      return this;
+    }
+
+    /**
+     * S3 Call.
+     * @param value new value
+     * @return the builder
+     */
+    public RequestFactoryBuilder withS3Call(final S3RequestCall value) {
+      this.S3RequestCall = value;
       return this;
     }
   }
